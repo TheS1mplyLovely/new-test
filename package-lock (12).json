@@ -1,8 +1,12 @@
+export type PlantStatus = 'Healthy' | 'Warning' | 'Critical';
+
 export interface SensorData {
-  plantStatus: string;
+  plantStatus: PlantStatus;
   stressScore: number;
   soilMoisture: number;
   temperature: number;
+  hourlySoundCount: number;
+  peakFrequencyKHz: number;
   measuredRgb: { r: number; g: number; b: number };
   timestamp: string;
 }
