@@ -1,0 +1,53 @@
+workflows:
+  android-release:
+    name: Domniot Android APK
+    max_build_duration: 60
+    environment:
+      node: 22.12.0
+      java: 21
+      vars:
+        PACKAGE_NAME: "com.domniot.app"
+    scripts:
+      - name: Install npm dependencies
+        script: npm install
+
+      - name: Install Capacitor CLI
+        script: npm install -g @capacitor/cli
+
+      - name: Build web assets
+        script: |
+          echo "GEMINI_API_KEY=${GEMINI_API_KEY:-}" > .env
+          npm run build
+
+      - name: Add Android platform
+        script: |
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
+
+      - name: Sync Capacitor
+        script: npx cap sync android
+
+      - name: Set AndroidManifest permissions
+        script: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          # cleartext (ESP32 HTTP)
+          if ! grep -q "usesCleartextTraffic" "$MANIFEST"; then
+            sed -i 's/<application/<application android:usesCleartextTraffic="true"/' "$MANIFEST"
+          fi
+
+      - name: Build debug APK
+        script: |
+          cd android
+          ./gradlew assembleDebug
+
+    artifacts:
+      - android/app/build/outputs/apk/debug/app-debug.apk
+
+    publishing:
+      email:
+        recipients:
+          - your@email.com
+        notify:
+          success: true
+          failure: true
