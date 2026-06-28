@@ -33,7 +33,7 @@ workflows:
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           # cleartext (ESP32 HTTP)
           if ! grep -q "usesCleartextTraffic" "$MANIFEST"; then
-            sed -i '' 's/<application/<application android:usesCleartextTraffic="true"/' "$MANIFEST"
+            sed -i 's/<application/<application android:usesCleartextTraffic="true"/' "$MANIFEST"
           fi
 
       - name: Build debug APK

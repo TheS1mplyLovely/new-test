@@ -1,4 +1,5 @@
 import { SensorData, EspResponse } from '../types';
+import { estimatePeakFrequencyKHz } from '../utils/thresholds';
 
 class EspService {
   private static instance: EspService;
@@ -44,13 +45,18 @@ class EspService {
     }
   }
 
-  // Simulation mode for preview
+  // Simulation mode for preview — eşik tablosundaki üç durumu da kapsayan rastgele ham veri üretir.
+  // Durum (plantStatus) ve stres puanı App.tsx içinde evaluatePlantStatus/computeStressScore ile hesaplanır.
   getMockData(): SensorData {
+    const soilMoisture = Math.round(Math.random() * 15 * 10) / 10; // %0 - %15
+    const hourlySoundCount = Math.round(Math.random() * 45 * 10) / 10; // 0 - 45 ses/saat
     return {
-      plantStatus: Math.random() > 0.8 ? 'Stressed' : 'Healthy',
-      stressScore: Math.floor(Math.random() * 100),
-      soilMoisture: Math.floor(Math.random() * 100),
-      temperature: 22 + Math.floor(Math.random() * 10),
+      plantStatus: 'Healthy',
+      stressScore: 0,
+      soilMoisture,
+      temperature: Math.round((18 + Math.random() * 12) * 10) / 10,
+      hourlySoundCount,
+      peakFrequencyKHz: estimatePeakFrequencyKHz(hourlySoundCount),
       measuredRgb: {
         r: Math.floor(Math.random() * 255),
         g: Math.floor(Math.random() * 255),

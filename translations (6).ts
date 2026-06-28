@@ -16,7 +16,8 @@ import {
   Camera,
   RotateCcw,
   Bell,
-  BellOff
+  BellOff,
+  Volume2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -35,6 +36,7 @@ import { twMerge } from 'tailwind-merge';
 import { SensorData, AppSettings } from './types';
 import { espService } from './services/espService';
 import { translations } from './translations';
+import { evaluatePlantStatus, computeStressScore } from './utils/thresholds';
 
 // Utility for tailwind classes
 function cn(...inputs: ClassValue[]) {
@@ -59,14 +61,37 @@ export default function App() {
   const videoRef = React.useRef<HTMLVideoElement>(null);
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
 
-  const [settings, setSettings] = useState<AppSettings>({
-    espIp: '192.168.1.100',
-    referenceRgb: { r: 120, g: 180, b: 80 },
-    pollingInterval: 5000,
-    language: 'en',
-    theme: 'dark',
-    notificationsEnabled: false
-  });
+  // Ayarları localStorage'dan yükle, yoksa varsayılanları kullan
+  const loadSettings = (): AppSettings => {
+    try {
+      const saved = localStorage.getItem('domniot_settings');
+      if (saved) return { ...{
+        espIp: '192.168.1.100',
+        referenceRgb: { r: 120, g: 180, b: 80 },
+        pollingInterval: 5000,
+        language: 'en',
+        theme: 'dark',
+        notificationsEnabled: false
+      }, ...JSON.parse(saved) };
+    } catch {}
+    return {
+      espIp: '192.168.1.100',
+      referenceRgb: { r: 120, g: 180, b: 80 },
+      pollingInterval: 5000,
+      language: 'en',
+      theme: 'dark',
+      notificationsEnabled: false
+    };
+  };
+
+  const [settings, setSettings] = useState<AppSettings>(loadSettings);
+
+  // Ayarlar değişince localStorage'a kaydet
+  useEffect(() => {
+    try {
+      localStorage.setItem('domniot_settings', JSON.stringify(settings));
+    } catch {}
+  }, [settings]);
 
   const lastNotificationTime = React.useRef<number>(0);
   const NOTIFICATION_COOLDOWN = 60000; // 1 minute
@@ -102,6 +127,11 @@ export default function App() {
 
   // Notification Logic — Capacitor native + web fallback
   const requestNotificationPermission = async () => {
+    // Zaten açıksa kapat
+    if (settings.notificationsEnabled) {
+      setSettings(prev => ({ ...prev, notificationsEnabled: false }));
+      return;
+    }
     try {
       if (Capacitor.isNativePlatform()) {
         const result = await LocalNotifications.requestPermissions();
@@ -120,7 +150,7 @@ export default function App() {
             alert(t.notificationPermissionDenied);
           }
         } else {
-          setSettings(prev => ({ ...prev, notificationsEnabled: !prev.notificationsEnabled }));
+          setSettings(prev => ({ ...prev, notificationsEnabled: true }));
         }
       }
     } catch (err) {
@@ -165,19 +195,30 @@ export default function App() {
       }
 
       // Merge camera analysis if available
+      let visualSimilarity: number | undefined;
       if (cameraAnalysisRgb) {
         data.measuredRgb = cameraAnalysisRgb;
-        const similarity = Number(calculateSimilarity(cameraAnalysisRgb, settings.referenceRgb));
-        data.plantStatus = similarity > 85 ? 'Healthy' : 'Stressed';
-        data.stressScore = Math.max(0, 100 - similarity);
+        visualSimilarity = Number(calculateSimilarity(cameraAnalysisRgb, settings.referenceRgb));
       }
 
+      // Akustik + toprak nemi + (varsa) görsel benzerlik eşik tablosuna göre durumu belirler
+      data.plantStatus = evaluatePlantStatus({
+        soilMoisture: data.soilMoisture,
+        hourlySoundCount: data.hourlySoundCount,
+        visualSimilarity
+      });
+      data.stressScore = computeStressScore({
+        soilMoisture: data.soilMoisture,
+        hourlySoundCount: data.hourlySoundCount,
+        visualSimilarity
+      });
+
       // Check for notification triggers
-      if (data.soilMoisture < 30) {
-        sendNotification(t.lowMoistureAlert, `${t.moistureLevelIs} ${data.soilMoisture}%. ${t.checkPlant}`);
+      if (data.plantStatus === 'Warning') {
+        sendNotification(t.earlyWarningTitle, t.statusMessageWarning);
       }
-      if (data.stressScore > 70) {
-        sendNotification(t.highStressAlert, `${t.stressLevelIs} ${data.stressScore}%. ${t.checkPlant}`);
+      if (data.plantStatus === 'Critical') {
+        sendNotification(t.criticalAlertTitle, t.statusMessageCritical);
       }
 
       setSensorData(data);
@@ -325,12 +366,20 @@ export default function App() {
     // If we have sensor data, update it with the camera RGB to "support" health status
     if (sensorData) {
       const similarity = Number(calculateSimilarity(newRgb, settings.referenceRgb));
-      const newStatus = similarity > 85 ? t.healthy : t.stressed;
+      const newStatus = evaluatePlantStatus({
+        soilMoisture: sensorData.soilMoisture,
+        hourlySoundCount: sensorData.hourlySoundCount,
+        visualSimilarity: similarity
+      });
       setSensorData({
         ...sensorData,
         measuredRgb: newRgb,
         plantStatus: newStatus,
-        stressScore: Math.max(0, 100 - similarity)
+        stressScore: computeStressScore({
+          soilMoisture: sensorData.soilMoisture,
+          hourlySoundCount: sensorData.hourlySoundCount,
+          visualSimilarity: similarity
+        })
       });
     }
   };
@@ -339,10 +388,11 @@ export default function App() {
     setCapturedImage(null);
     setCameraRgb(null);
     setCameraAnalysisRgb(null);
-    startCamera();
+    if (!Capacitor.isNativePlatform()) startCamera();
   };
 
   useEffect(() => {
+    if (Capacitor.isNativePlatform()) return; // Native: video stream yok
     if (activeTab === 'camera') {
       startCamera(selectedCameraId);
     } else {
@@ -449,8 +499,10 @@ export default function App() {
                     <div className="flex items-center gap-2 mb-4">
                       {sensorData?.plantStatus === 'Healthy' ? (
                         <CheckCircle2 className="text-emerald-500" size={20} />
-                      ) : (
+                      ) : sensorData?.plantStatus === 'Warning' ? (
                         <AlertTriangle className="text-amber-500" size={20} />
+                      ) : (
+                        <AlertTriangle className="text-red-500" size={20} />
                       )}
                       <span className={cn(
                         "text-[10px] font-bold uppercase tracking-widest",
@@ -462,9 +514,17 @@ export default function App() {
                         </span>
                       )}
                     </div>
-                    <h2 className="text-5xl md:text-7xl font-bold tracking-tighter mb-2 italic">
-                      {sensorData?.plantStatus === 'Healthy' ? t.healthy : sensorData?.plantStatus === 'Stressed' ? t.stressed : t.healthy}
+                    <h2 className="text-3xl md:text-5xl font-bold tracking-tighter mb-2 italic leading-tight">
+                      {sensorData?.plantStatus === 'Healthy' ? t.healthy : sensorData?.plantStatus === 'Warning' ? t.earlyWarning : t.critical}
                     </h2>
+                    <p className={cn(
+                      "text-xs md:text-sm font-medium",
+                      sensorData?.plantStatus === 'Healthy'
+                        ? "text-emerald-500"
+                        : sensorData?.plantStatus === 'Warning' ? "text-amber-500" : "text-red-500"
+                    )}>
+                      {sensorData?.plantStatus === 'Healthy' ? t.statusMessageHealthy : sensorData?.plantStatus === 'Warning' ? t.statusMessageWarning : t.statusMessageCritical}
+                    </p>
                     <div className="flex flex-col sm:flex-row gap-4 sm:gap-8 mt-6 md:mt-8">
                       <div>
                         <p className={cn(
@@ -490,7 +550,7 @@ export default function App() {
 
                 {/* Sensor Grid */}
                 <div className={cn(
-                  "md:col-span-4 border rounded-[2rem] p-6 transition-colors duration-500",
+                  "md:col-span-3 border rounded-[2rem] p-6 transition-colors duration-500",
                   settings.theme === 'dark' ? "bg-white/5 border-white/10" : "bg-white border-black/5 shadow-sm"
                 )}>
                   <div className="flex justify-between items-start mb-8">
@@ -522,7 +582,7 @@ export default function App() {
                 </div>
 
                 <div className={cn(
-                  "md:col-span-4 border rounded-[2rem] p-6 transition-colors duration-500",
+                  "md:col-span-3 border rounded-[2rem] p-6 transition-colors duration-500",
                   settings.theme === 'dark' ? "bg-white/5 border-white/10" : "bg-white border-black/5 shadow-sm"
                 )}>
                   <div className="flex justify-between items-start mb-8">
@@ -547,9 +607,36 @@ export default function App() {
                   )}>Optimal range: 18°C - 28°C</p>
                 </div>
 
+                {/* Akustik (Piezo) Sensör */}
+                <div className={cn(
+                  "md:col-span-3 border rounded-[2rem] p-6 transition-colors duration-500",
+                  settings.theme === 'dark' ? "bg-white/5 border-white/10" : "bg-white border-black/5 shadow-sm"
+                )}>
+                  <div className="flex justify-between items-start mb-8">
+                    <div className="p-3 rounded-2xl bg-purple-500/20 text-purple-500">
+                      <Volume2 size={24} />
+                    </div>
+                    <span className={cn(
+                      "text-[10px] font-bold uppercase tracking-widest",
+                      settings.theme === 'dark' ? "text-white/40" : "text-black/40"
+                    )}>{t.acousticActivity}</span>
+                  </div>
+                  <div className="flex items-baseline gap-2">
+                    <span className="text-5xl md:text-6xl font-bold tracking-tighter">{sensorData?.hourlySoundCount ?? 0}</span>
+                    <span className={cn(
+                      "text-xl font-mono",
+                      settings.theme === 'dark' ? "text-white/40" : "text-black/40"
+                    )}>/{t.hour}</span>
+                  </div>
+                  <p className={cn(
+                    "mt-4 text-[10px] font-bold uppercase tracking-widest",
+                    settings.theme === 'dark' ? "text-white/40" : "text-black/40"
+                  )}>{t.peakFrequency}: {sensorData?.peakFrequencyKHz ? `${sensorData.peakFrequencyKHz} kHz` : '—'}</p>
+                </div>
+
                 {/* RGB Analysis */}
                 <div className={cn(
-                  "md:col-span-4 border rounded-[2rem] p-6 flex flex-col justify-between transition-colors duration-500",
+                  "md:col-span-3 border rounded-[2rem] p-6 flex flex-col justify-between transition-colors duration-500",
                   settings.theme === 'dark' ? "bg-white/5 border-white/10" : "bg-white border-black/5 shadow-sm"
                 )}>
                   <div className="flex justify-between items-start">
@@ -669,9 +756,13 @@ export default function App() {
                             <td className="px-6 py-4">
                               <span className={cn(
                                 "px-2 py-1 rounded-md text-[8px] font-bold uppercase tracking-widest",
-                                entry.plantStatus === 'Healthy' ? "bg-emerald-500/10 text-emerald-500" : "bg-amber-500/10 text-amber-500"
+                                entry.plantStatus === 'Healthy'
+                                  ? "bg-emerald-500/10 text-emerald-500"
+                                  : entry.plantStatus === 'Warning'
+                                    ? "bg-amber-500/10 text-amber-500"
+                                    : "bg-red-500/10 text-red-500"
                               )}>
-                                {entry.plantStatus === 'Healthy' ? t.healthy : t.stressed}
+                                {entry.plantStatus === 'Healthy' ? t.healthy : entry.plantStatus === 'Warning' ? t.earlyWarning : t.critical}
                               </span>
                             </td>
                           </tr>
@@ -731,29 +822,54 @@ export default function App() {
                   <div className="relative aspect-video rounded-[2rem] overflow-hidden bg-black/20 border border-white/5">
                     {!capturedImage ? (
                       <>
-                        <video 
-                          ref={videoRef} 
-                          autoPlay 
-                          playsInline 
-                          className="w-full h-full object-cover"
-                        />
-                        {cameraError && (
-                          <div className="absolute inset-0 flex items-center justify-center bg-black/60 text-white p-4 text-center">
-                            <div className="space-y-2">
-                              <AlertTriangle className="mx-auto text-amber-500" size={32} />
-                              <p className="text-sm font-bold">{cameraError}</p>
-                            </div>
+                        {Capacitor.isNativePlatform() ? (
+                          <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 bg-black/30">
+                            <Camera size={64} className="opacity-40" />
+                            <p className="text-white/60 text-sm font-bold uppercase tracking-widest text-center px-8">
+                              Fotoğraf çekmek için butona bas
+                            </p>
+                            {cameraError && (
+                              <div className="flex items-center gap-2 text-amber-400">
+                                <AlertTriangle size={16} />
+                                <p className="text-xs font-bold">{cameraError}</p>
+                              </div>
+                            )}
+                            <button
+                              onClick={capturePhoto}
+                              className="w-20 h-20 rounded-full bg-white flex items-center justify-center shadow-xl hover:scale-105 transition-transform"
+                            >
+                              <div className="w-14 h-14 rounded-full border-2 border-black/10 flex items-center justify-center">
+                                <Camera size={28} className="text-black" />
+                              </div>
+                            </button>
                           </div>
+                        ) : (
+                          <>
+                            <video
+                              ref={videoRef}
+                              autoPlay
+                              playsInline
+                              className="w-full h-full object-cover"
+                            />
+                            {cameraError && (
+                              <div className="absolute inset-0 flex items-center justify-center bg-black/60 text-white p-4 text-center">
+                                <div className="space-y-2">
+                                  <AlertTriangle className="mx-auto text-amber-500" size={32} />
+                                  <p className="text-sm font-bold">{cameraError}</p>
+                                </div>
+                              </div>
+                            )}
+                            <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex gap-4">
+                              <button
+                                onClick={capturePhoto}
+                                disabled={!cameraStream}
+                                className="w-16 h-16 rounded-full bg-white flex items-center justify-center shadow-xl hover:scale-105 transition-transform disabled:opacity-50 disabled:scale-100"
+                              >
+                                <div className="w-12 h-12 rounded-full border-2 border-black/10" />
+                              </button>
+                            </div>
+                          </>
                         )}
-                        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex gap-4">
-                          <button 
-                            onClick={capturePhoto}
-                            disabled={!cameraStream}
-                            className="w-16 h-16 rounded-full bg-white flex items-center justify-center shadow-xl hover:scale-105 transition-transform disabled:opacity-50 disabled:scale-100"
-                          >
-                            <div className="w-12 h-12 rounded-full border-2 border-black/10" />
-                          </button>
-                        </div>
                       </>
                     ) : (
                       <>
@@ -801,7 +917,14 @@ export default function App() {
                         <p className="text-[10px] uppercase tracking-widest font-bold opacity-40 mb-4">{t.plantCondition}</p>
                         <div className="flex items-center gap-6">
                           <div className="text-4xl font-bold italic tracking-tighter">
-                            {Number(calculateSimilarity(cameraRgb, settings.referenceRgb)) > 85 ? t.healthy : t.stressed}
+                            {(() => {
+                              const camStatus = evaluatePlantStatus({
+                                soilMoisture: sensorData?.soilMoisture ?? 100,
+                                hourlySoundCount: sensorData?.hourlySoundCount ?? 0,
+                                visualSimilarity: Number(calculateSimilarity(cameraRgb, settings.referenceRgb))
+                              });
+                              return camStatus === 'Healthy' ? t.healthy : camStatus === 'Warning' ? t.earlyWarning : t.critical;
+                            })()}
                           </div>
                           <div className="flex-1">
                             <div className="flex justify-between text-[10px] font-bold uppercase tracking-widest mb-2">
@@ -913,53 +1036,28 @@ export default function App() {
                       settings.theme === 'dark' ? "text-white/40" : "text-black/40"
                     )}>{t.interfaceLanguage}</label>
                     <div className={cn(
-                      "flex border rounded-2xl p-1 transition-colors",
+                      "grid grid-cols-2 gap-1 border rounded-2xl p-1 transition-colors",
                       settings.theme === 'dark' ? "bg-black/40 border-white/10" : "bg-black/5 border-black/10"
                     )}>
-                      <button 
-                        onClick={() => setSettings({...settings, language: 'en'})}
-                        className={cn(
-                          "flex-1 py-3 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all", 
-                          settings.language === 'en' 
-                            ? settings.theme === 'dark' ? "bg-white/10 text-white" : "bg-black/10 text-black"
-                            : settings.theme === 'dark' ? "text-white/40 hover:text-white" : "text-black/40 hover:text-black"
-                        )}
-                      >
-                        {t.english}
-                      </button>
-                      <button 
-                        onClick={() => setSettings({...settings, language: 'tr'})}
-                        className={cn(
-                          "flex-1 py-3 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all", 
-                          settings.language === 'tr' 
-                            ? settings.theme === 'dark' ? "bg-white/10 text-white" : "bg-black/10 text-black"
-                            : settings.theme === 'dark' ? "text-white/40 hover:text-white" : "text-black/40 hover:text-black"
-                        )}
-                      >
-                        {t.turkish}
-                      </button>
-                      <button 
-                        onClick={() => setSettings({...settings, language: 'ru'})}
-                        className={cn(
-                          "flex-1 py-3 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all", 
-                          settings.language === 'ru' 
-                            ? settings.theme === 'dark' ? "bg-white/10 text-white" : "bg-black/10 text-black"
-                            : settings.theme === 'dark' ? "text-white/40 hover:text-white" : "text-black/40 hover:text-black"
-                        )}
-                      >
-                        {t.russian}
-                      </button>
-                      <button 
-                        onClick={() => setSettings({...settings, language: 'az'})}
-                        className={cn(
-                          "flex-1 py-3 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all", 
-                          settings.language === 'az' 
-                            ? settings.theme === 'dark' ? "bg-white/10 text-white" : "bg-black/10 text-black"
-                            : settings.theme === 'dark' ? "text-white/40 hover:text-white" : "text-black/40 hover:text-black"
-                        )}
-                      >
-                        {t.azerbaijani}
-                      </button>
+                      {([
+                        { code: 'en', label: t.english },
+                        { code: 'tr', label: t.turkish },
+                        { code: 'ru', label: t.russian },
+                        { code: 'az', label: t.azerbaijani },
+                      ] as { code: typeof settings.language, label: string }[]).map(({ code, label }) => (
+                        <button
+                          key={code}
+                          onClick={() => setSettings({...settings, language: code})}
+                          className={cn(
+                            "py-3 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all",
+                            settings.language === code
+                              ? settings.theme === 'dark' ? "bg-white/10 text-white" : "bg-black/10 text-black"
+                              : settings.theme === 'dark' ? "text-white/40 hover:text-white" : "text-black/40 hover:text-black"
+                          )}
+                        >
+                          {label}
+                        </button>
+                      ))}
                     </div>
                   </div>
 
